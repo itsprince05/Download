@@ -1,5 +1,6 @@
 """
 Telegram bot handler — processes commands ONLY from the allowed group.
+PocketFM uses MPEG-DASH (.mpd) — this handler manages the full capture pipeline.
 """
 
 import asyncio
@@ -51,14 +52,17 @@ async def ignore_other_chats(message: Message):
 async def cmd_start(message: Message):
     """Send welcome info."""
     text = (
-        "🤖 <b>PocketFM Audio Capture Bot</b>\n\n"
-        "📋 <b>Available Commands:</b>\n"
-        "├ /capture — Start browser, detect & download audio\n"
+        "🤖 <b>PocketFM Audio Capture Bot</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "📋 <b>Commands:</b>\n"
+        "├ /capture — Start full capture pipeline\n"
         "├ /status — Check current status\n"
         "├ /screenshot — Take a single screenshot\n"
-        "├ /urls — Show all captured audio URLs\n"
-        "├ /stop — Stop current capture session\n"
+        "├ /urls — Show all captured media URLs\n"
+        "├ /debug — Show all network requests\n"
+        "├ /stop — Stop current session\n"
         "└ /help — Show this message\n\n"
+        "📡 <b>Supports:</b> MPD/DASH, HLS/M3U8, Direct files\n"
         "⚡ Bot responds ONLY in this group."
     )
     await message.answer(text, parse_mode=ParseMode.HTML)
@@ -73,7 +77,7 @@ async def cmd_help(message: Message):
 # ─── /capture command ───────────────────────────────────────────────
 @router.message(Command("capture"), F.chat.id == ALLOWED_GROUP_ID)
 async def cmd_capture(message: Message):
-    """Main workflow — launch browser, navigate, detect audio, download, send."""
+    """Main workflow — launch browser, navigate, detect MPD, download via ffmpeg, send."""
     global _capture_task
 
     if _capture_task and not _capture_task.done():
@@ -84,12 +88,13 @@ async def cmd_capture(message: Message):
 
 
 async def _run_capture(message: Message):
-    """Execute the full capture pipeline."""
+    """Execute the full capture pipeline for MPD/DASH audio."""
     bot = message.bot
     chat_id = ALLOWED_GROUP_ID
     status_msg = await bot.send_message(
         chat_id,
-        "🚀 <b>Starting capture pipeline...</b>",
+        "🚀 <b>Starting PocketFM capture pipeline...</b>\n"
+        "📡 Looking for MPEG-DASH (.mpd) streams",
         parse_mode=ParseMode.HTML,
     )
 
@@ -112,7 +117,8 @@ async def _run_capture(message: Message):
         page_info = await _browser_mgr.get_page_info()
         await _update_status(
             bot, status_msg,
-            f"📄 Page loaded: <b>{page_info['title']}</b>\n🔍 Looking for episodes..."
+            f"📄 Page loaded: <b>{page_info['title']}</b>\n"
+            f"🔍 Looking for episodes..."
         )
 
         # ── Step 4: Play Episode ────────────────────────────────
@@ -120,60 +126,108 @@ async def _run_capture(message: Message):
         play_ok = await _browser_mgr.find_and_play_episode()
 
         if play_ok:
-            await _update_status(bot, status_msg, "✅ Episode play triggered! Monitoring network...")
+            await _update_status(
+                bot, status_msg,
+                "✅ Episode play triggered!\n📡 Scanning for MPD/DASH streams..."
+            )
         else:
             await _update_status(
                 bot, status_msg,
-                "⚠️ Could not auto-click play. Monitoring network anyway..."
+                "⚠️ Could not auto-click play.\n📡 Scanning network anyway..."
             )
 
-        # ── Step 5: Wait for Audio URL ──────────────────────────
-        await _update_status(bot, status_msg, "🔍 Scanning network traffic for audio URLs...")
+        # ── Step 5: Wait for Audio/MPD URL ──────────────────────
+        await _update_status(
+            bot, status_msg,
+            "🔍 Monitoring network traffic for .mpd / audio URLs...\n"
+            "⏳ This may take up to 90 seconds..."
+        )
         audio_url = await _browser_mgr.wait_for_audio_detection(timeout=90)
 
         if not audio_url:
-            # Show all captured URLs for debugging
+            # Show debug info
             all_urls = _browser_mgr.network_monitor.get_all_urls()
+            debug_reqs = _browser_mgr.network_monitor.get_debug_requests(20)
+
+            debug_text = "❌ <b>No audio/MPD URL detected after 90s</b>\n\n"
+
             if all_urls:
-                url_list = "\n".join(
-                    f"• Score {u['score']}: <code>{u['url'][:80]}</code>"
-                    for u in all_urls[:10]
-                )
-                await bot.send_message(
-                    chat_id,
-                    f"📡 <b>Captured URLs (no audio confirmed):</b>\n{url_list}",
-                    parse_mode=ParseMode.HTML,
-                )
-            await _update_status(bot, status_msg, "❌ No audio URL detected after 90s.")
+                debug_text += "📡 <b>Captured media URLs:</b>\n"
+                for u in all_urls[:10]:
+                    debug_text += f"• [Score {u['score']}] <code>{u['url'][:80]}</code>\n"
+            else:
+                debug_text += "📡 No media URLs captured at all.\n"
+
+            debug_text += f"\n📊 Total network requests: {len(_browser_mgr.network_monitor.all_requests)}"
+
+            if debug_reqs:
+                debug_text += "\n\n🔗 <b>Recent requests:</b>\n"
+                for r in debug_reqs[-10:]:
+                    debug_text += f"• [{r['type']}] <code>{r['url'][:70]}</code>\n"
+
+            # Split if too long
+            if len(debug_text) > 4000:
+                debug_text = debug_text[:4000] + "..."
+
+            await bot.send_message(chat_id, debug_text, parse_mode=ParseMode.HTML)
+            await _update_status(bot, status_msg, "❌ Capture failed — no streams found.")
             return
+
+        # Identify stream type
+        stream_type = "MPD/DASH" if ".mpd" in audio_url.lower() else "HLS" if ".m3u8" in audio_url.lower() else "Direct"
 
         await _update_status(
             bot, status_msg,
-            f"🎵 Audio URL found!\n<code>{audio_url[:100]}</code>\n\n⬇️ Downloading..."
+            f"🎵 <b>{stream_type} stream found!</b>\n"
+            f"<code>{audio_url[:120]}</code>\n\n"
+            f"🔍 Probing stream info..."
         )
 
-        # ── Step 6: Download Audio ──────────────────────────────
-        last_progress_update = 0
+        # ── Step 5.5: Probe the stream ──────────────────────────
+        probe_info = await _audio_downloader.probe_url(audio_url)
+        if probe_info:
+            streams = probe_info.get("streams", [])
+            fmt = probe_info.get("format", {})
+            duration = fmt.get("duration", "Unknown")
+            format_name = fmt.get("format_name", "Unknown")
 
-        async def progress_cb(downloaded, total):
-            nonlocal last_progress_update
-            now = time.time()
-            if now - last_progress_update < 3:
-                return
-            last_progress_update = now
-
-            if total > 0:
-                pct = (downloaded / total) * 100
-                bar = "█" * int(pct / 5) + "░" * (20 - int(pct / 5))
-                size_mb = downloaded / 1024 / 1024
-                total_mb = total / 1024 / 1024
-                text = (
-                    f"⬇️ <b>Downloading...</b>\n"
-                    f"[{bar}] {pct:.1f}%\n"
-                    f"{size_mb:.1f}MB / {total_mb:.1f}MB"
+            audio_streams = [s for s in streams if s.get("codec_type") == "audio"]
+            info_text = (
+                f"📊 <b>Stream Info:</b>\n"
+                f"├ Format: {format_name}\n"
+                f"├ Duration: {float(duration):.0f}s\n" if duration != "Unknown" else ""
+                f"├ Audio tracks: {len(audio_streams)}\n"
+            )
+            if audio_streams:
+                a = audio_streams[0]
+                info_text += (
+                    f"├ Codec: {a.get('codec_name', '?')}\n"
+                    f"├ Sample rate: {a.get('sample_rate', '?')}Hz\n"
+                    f"└ Bitrate: {int(a.get('bit_rate', 0)) // 1000}kbps\n"
                 )
+            await bot.send_message(chat_id, info_text, parse_mode=ParseMode.HTML)
+
+        # ── Step 6: Download via FFmpeg ─────────────────────────
+        await _update_status(
+            bot, status_msg,
+            f"⬇️ <b>Downloading {stream_type} stream via FFmpeg...</b>\n"
+            f"This uses ffmpeg to properly download and mux the audio."
+        )
+
+        last_progress_update = [0]
+
+        async def progress_cb(status_text, pct):
+            now = time.time()
+            if now - last_progress_update[0] < 3:
+                return
+            last_progress_update[0] = now
+
+            if pct > 0:
+                bar = "█" * int(pct / 5) + "░" * (20 - int(pct / 5))
+                text = f"⬇️ <b>FFmpeg Download</b>\n[{bar}] {pct:.1f}%\n{status_text}"
             else:
-                text = f"⬇️ Downloading... {downloaded} segments"
+                text = f"⬇️ <b>FFmpeg Download</b>\n{status_text}"
+
             try:
                 await _update_status(bot, status_msg, text)
             except Exception:
@@ -182,7 +236,15 @@ async def _run_capture(message: Message):
         filepath = await _audio_downloader.download(audio_url, progress_callback=progress_cb)
 
         if not filepath:
-            await _update_status(bot, status_msg, "❌ Download failed after all retries.")
+            await _update_status(bot, status_msg, "❌ FFmpeg download failed after all retries.")
+
+            # Show all URLs as fallback options
+            all_urls = _browser_mgr.network_monitor.get_all_urls()
+            if all_urls:
+                text = "📡 <b>All detected URLs (try manually):</b>\n\n"
+                for i, u in enumerate(all_urls[:10], 1):
+                    text += f"{i}. [Score {u['score']}]\n<code>{u['url'][:120]}</code>\n\n"
+                await bot.send_message(chat_id, text, parse_mode=ParseMode.HTML)
             return
 
         file_size = os.path.getsize(filepath)
@@ -190,7 +252,7 @@ async def _run_capture(message: Message):
 
         await _update_status(
             bot, status_msg,
-            f"✅ Download complete! ({size_mb:.2f}MB)\n📤 Sending to group..."
+            f"✅ Download complete! ({size_mb:.2f}MB)\n📤 Sending audio to group..."
         )
 
         # ── Step 7: Send Audio to Group ─────────────────────────
@@ -210,6 +272,7 @@ async def _run_capture(message: Message):
                 title=page_info.get("title", "PocketFM Audio"),
                 caption=(
                     f"🎧 <b>PocketFM Audio Capture</b>\n"
+                    f"📡 Stream: {stream_type}\n"
                     f"📄 {page_info.get('title', 'Unknown')}\n"
                     f"💾 Size: {size_mb:.2f}MB"
                 ),
@@ -217,19 +280,6 @@ async def _run_capture(message: Message):
             )
 
         await _update_status(bot, status_msg, "✅ <b>Capture complete!</b> Audio sent successfully.")
-
-        # Show all captured URLs for reference
-        all_urls = _browser_mgr.network_monitor.get_all_urls()
-        if all_urls:
-            url_list = "\n".join(
-                f"• Score {u['score']}: <code>{u['url'][:80]}...</code>"
-                for u in all_urls[:5]
-            )
-            await bot.send_message(
-                chat_id,
-                f"📡 <b>All captured audio URLs:</b>\n{url_list}",
-                parse_mode=ParseMode.HTML,
-            )
 
     except asyncio.CancelledError:
         await bot.send_message(chat_id, "🛑 Capture session cancelled.")
@@ -244,7 +294,6 @@ async def _run_capture(message: Message):
         except Exception:
             pass
     finally:
-        # Stop screenshot streaming
         try:
             await _screenshot_streamer.stop()
         except Exception:
@@ -271,16 +320,21 @@ async def cmd_status(message: Message):
     browser_running = _browser_mgr.is_running if _browser_mgr else False
     capture_running = _capture_task is not None and not _capture_task.done()
     urls_count = len(_browser_mgr.network_monitor.captured_urls) if _browser_mgr else 0
+    total_reqs = len(_browser_mgr.network_monitor.all_requests) if _browser_mgr else 0
+    mpd_count = len(_browser_mgr.network_monitor.get_mpd_urls()) if _browser_mgr else 0
 
     page_info = {"title": "N/A", "url": "N/A"}
     if browser_running:
         page_info = await _browser_mgr.get_page_info()
 
     text = (
-        "📊 <b>Bot Status</b>\n\n"
+        "📊 <b>Bot Status</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"🌐 Browser: {'🟢 Running' if browser_running else '🔴 Stopped'}\n"
         f"🎯 Capture: {'🟢 Active' if capture_running else '🔴 Idle'}\n"
-        f"📡 Captured URLs: {urls_count}\n"
+        f"📡 Media URLs: {urls_count}\n"
+        f"📺 MPD URLs: {mpd_count}\n"
+        f"🔗 Total Requests: {total_reqs}\n"
         f"📄 Page: {page_info['title'][:50]}\n"
         f"🔗 URL: <code>{page_info['url'][:80]}</code>"
     )
@@ -308,23 +362,71 @@ async def cmd_screenshot(message: Message):
 # ─── /urls command ──────────────────────────────────────────────────
 @router.message(Command("urls"), F.chat.id == ALLOWED_GROUP_ID)
 async def cmd_urls(message: Message):
-    """Show all captured audio URLs."""
+    """Show all captured media URLs with types."""
     if not _browser_mgr:
         await message.answer("⚠️ Browser manager not initialized.")
         return
 
     urls = _browser_mgr.network_monitor.get_all_urls()
     if not urls:
-        await message.answer("📡 No audio URLs captured yet.")
+        await message.answer("📡 No media URLs captured yet.")
         return
 
-    text = "📡 <b>Captured Audio URLs:</b>\n\n"
+    text = "📡 <b>Captured Media URLs:</b>\n\n"
     for i, u in enumerate(urls[:15], 1):
+        url_str = u['url']
+        # Tag the type
+        if ".mpd" in url_str.lower():
+            tag = "🔴 MPD"
+        elif ".m3u8" in url_str.lower():
+            tag = "🟠 HLS"
+        elif ".m4s" in url_str.lower() or ".ts" in url_str.lower():
+            tag = "🟡 SEG"
+        elif any(ext in url_str.lower() for ext in [".mp3", ".m4a", ".aac"]):
+            tag = "🟢 FILE"
+        else:
+            tag = "⚪ OTHER"
+
         text += (
-            f"<b>{i}.</b> Score: {u['score']}\n"
-            f"   Type: {u['content_type'][:30] or 'Unknown'}\n"
-            f"   <code>{u['url'][:100]}</code>\n\n"
+            f"<b>{i}.</b> {tag} | Score: {u['score']}\n"
+            f"   <code>{url_str[:100]}</code>\n\n"
         )
+
+    await message.answer(text, parse_mode=ParseMode.HTML)
+
+
+# ─── /debug command ─────────────────────────────────────────────────
+@router.message(Command("debug"), F.chat.id == ALLOWED_GROUP_ID)
+async def cmd_debug(message: Message):
+    """Show recent network requests for debugging."""
+    if not _browser_mgr:
+        await message.answer("⚠️ Browser not initialized.")
+        return
+
+    reqs = _browser_mgr.network_monitor.get_debug_requests(30)
+    if not reqs:
+        await message.answer("🔗 No network requests logged yet.")
+        return
+
+    text = f"🔗 <b>Recent Network Requests</b> ({len(_browser_mgr.network_monitor.all_requests)} total)\n\n"
+
+    # Group by type
+    type_counts = {}
+    for r in _browser_mgr.network_monitor.all_requests:
+        t = r['type']
+        type_counts[t] = type_counts.get(t, 0) + 1
+
+    text += "<b>Request types:</b>\n"
+    for t, c in sorted(type_counts.items(), key=lambda x: -x[1]):
+        text += f"  {t}: {c}\n"
+
+    text += "\n<b>Last 15 requests:</b>\n"
+    for r in reqs[-15:]:
+        text += f"• [{r['type']}] <code>{r['url'][:70]}</code>\n"
+
+    if len(text) > 4000:
+        text = text[:4000] + "..."
+
     await message.answer(text, parse_mode=ParseMode.HTML)
 
 
@@ -345,13 +447,14 @@ async def cmd_stop(message: Message):
         await _screenshot_streamer.stop()
         actions.append("📸 Screenshot streaming stopped")
 
+    if _audio_downloader:
+        await _audio_downloader.cancel()
+        await _audio_downloader.close()
+        actions.append("⬇️ Downloader stopped")
+
     if _browser_mgr and _browser_mgr.is_running:
         await _browser_mgr.close()
         actions.append("🌐 Browser closed")
-
-    if _audio_downloader:
-        await _audio_downloader.close()
-        actions.append("⬇️ Downloader session closed")
 
     if actions:
         text = "✅ <b>Session stopped:</b>\n" + "\n".join(f"  {a}" for a in actions)

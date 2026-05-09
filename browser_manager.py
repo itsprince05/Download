@@ -53,8 +53,7 @@ class BrowserManager:
         self._playwright = await async_playwright().start()
 
         self._browser = await self._playwright.chromium.launch(
-            channel="chrome",  # Require Google Chrome for Widevine DRM
-            headless=False,    # Run headful (inside Xvfb) to ensure DRM loads
+            headless=True,
             args=[
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
@@ -68,7 +67,7 @@ class BrowserManager:
                 "--disable-extensions",
                 "--disable-sync",
                 "--disable-translate",
-                "--autoplay-policy=no-user-gesture-required", # Crucial for auto-play
+                "--mute-audio",
                 "--disable-web-security",
             ],
         )

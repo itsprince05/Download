@@ -9,6 +9,7 @@ import asyncio
 import signal
 import sys
 import os
+import subprocess
 
 from logger import setup_logger
 from config import DOWNLOADS_DIR, SCREENSHOTS_DIR, ALLOWED_GROUP_ID
@@ -25,6 +26,17 @@ async def main():
     logger.info("=" * 60)
     logger.info("PocketFM Audio Capture Bot — Starting Up")
     logger.info("=" * 60)
+
+    # ── Setup Virtual Display & Audio for DRM Recording ─────────
+    logger.info("Setting up Xvfb and PulseAudio for real-time DRM recording...")
+    os.environ["DISPLAY"] = ":99"
+    subprocess.Popen(["Xvfb", ":99", "-screen", "0", "1920x1080x24"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    
+    # Start PulseAudio and create a virtual sink
+    os.system("pulseaudio -D --exit-idle-time=-1 2>/dev/null")
+    os.system("pactl load-module module-null-sink sink_name=VirtualSink 2>/dev/null")
+    os.system("pactl set-default-sink VirtualSink 2>/dev/null")
+    os.system("pactl set-default-source VirtualSink.monitor 2>/dev/null")
 
     # ── Create directories ──────────────────────────────────────
     os.makedirs(DOWNLOADS_DIR, exist_ok=True)

@@ -1,11 +1,13 @@
 """
-Audio downloader — downloads captured audio URLs with retry logic.
+Audio downloader — handles MPD/DASH, HLS/M3U8, and direct file downloads.
+PocketFM uses MPEG-DASH (.mpd) — ffmpeg handles it natively.
 """
 
 import asyncio
 import os
 import time
 import re
+import subprocess
 from typing import Optional
 from urllib.parse import urlparse, unquote
 
@@ -19,17 +21,19 @@ from config import (
     MAX_RETRIES,
     RETRY_DELAY,
     USER_AGENT,
+    FFMPEG_TIMEOUT,
 )
 
 logger = setup_logger("audio_downloader")
 
 
 class AudioDownloader:
-    """Downloads audio files from captured URLs with retry and progress tracking."""
+    """Downloads audio from MPD/DASH, HLS/M3U8, or direct URLs using ffmpeg."""
 
     def __init__(self):
         os.makedirs(DOWNLOADS_DIR, exist_ok=True)
         self._session: Optional[aiohttp.ClientSession] = None
+        self._current_process: Optional[asyncio.subprocess.Process] = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
         """Get or create an aiohttp session."""
@@ -46,70 +50,44 @@ class AudioDownloader:
             )
         return self._session
 
-    def _generate_filename(self, url: str, content_type: str = "") -> str:
-        """Generate a clean filename from URL or content type."""
-        parsed = urlparse(url)
-        path = unquote(parsed.path)
-        basename = os.path.basename(path)
-
-        # Clean up the filename
-        basename = re.sub(r'[<>:"/\\|?*]', '_', basename)
-
-        if not basename or basename == "/" or len(basename) < 3:
-            # Generate from timestamp
-            timestamp = int(time.time())
-            ext = self._guess_extension(url, content_type)
-            basename = f"pocketfm_audio_{timestamp}{ext}"
-
-        # Ensure it has an audio extension
-        _, ext = os.path.splitext(basename)
-        if ext.lower() not in [".mp3", ".m4a", ".aac", ".ogg", ".wav", ".flac", ".opus", ".webm", ".ts"]:
-            guessed = self._guess_extension(url, content_type)
-            basename = f"{basename}{guessed}"
-
-        return basename
-
-    def _guess_extension(self, url: str, content_type: str = "") -> str:
-        """Guess file extension from URL or content type."""
+    def _detect_stream_type(self, url: str) -> str:
+        """Detect if URL is MPD, HLS, or direct file."""
         url_lower = url.lower()
-
-        if ".mp3" in url_lower:
-            return ".mp3"
-        if ".m4a" in url_lower:
-            return ".m4a"
-        if ".aac" in url_lower:
-            return ".aac"
-        if ".m3u8" in url_lower:
-            return ".m3u8"
-        if ".ts" in url_lower:
-            return ".ts"
-
-        ct = content_type.lower()
-        if "mp3" in ct or "mpeg" in ct:
-            return ".mp3"
-        if "mp4" in ct or "m4a" in ct:
-            return ".m4a"
-        if "aac" in ct:
-            return ".aac"
-        if "ogg" in ct:
-            return ".ogg"
-
-        return ".mp3"  # Default
+        if ".mpd" in url_lower:
+            return "mpd"
+        elif ".m3u8" in url_lower:
+            return "hls"
+        else:
+            return "direct"
 
     async def download(self, url: str, progress_callback=None) -> Optional[str]:
         """
-        Download audio from URL. Returns the local file path on success.
-
-        Args:
-            url: The audio URL to download
-            progress_callback: Optional async callback(downloaded_bytes, total_bytes)
+        Download audio from URL. Auto-detects MPD/HLS/direct.
+        Returns the local file path on success.
         """
+        stream_type = self._detect_stream_type(url)
+        logger.info(f"Stream type detected: {stream_type} | URL: {url[:200]}")
+
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                logger.info(f"Download attempt {attempt}/{MAX_RETRIES}: {url[:150]}")
-                result = await self._do_download(url, progress_callback)
-                if result:
-                    return result
+                logger.info(f"Download attempt {attempt}/{MAX_RETRIES}")
+
+                if stream_type == "mpd":
+                    result = await self._download_mpd(url, progress_callback)
+                elif stream_type == "hls":
+                    result = await self._download_hls(url, progress_callback)
+                else:
+                    result = await self._download_direct(url, progress_callback)
+
+                if result and os.path.exists(result):
+                    file_size = os.path.getsize(result)
+                    if file_size > 10000:  # At least 10KB for valid audio
+                        logger.info(f"Download success: {result} ({file_size / 1024 / 1024:.2f}MB)")
+                        return result
+                    else:
+                        logger.warning(f"File too small ({file_size}B), retrying...")
+                        os.remove(result)
+
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -119,16 +97,157 @@ class AudioDownloader:
                 logger.info(f"Retrying in {RETRY_DELAY}s...")
                 await asyncio.sleep(RETRY_DELAY)
 
-        logger.error(f"All {MAX_RETRIES} download attempts failed for: {url[:150]}")
+        logger.error(f"All {MAX_RETRIES} download attempts failed")
         return None
 
-    async def _do_download(self, url: str, progress_callback=None) -> Optional[str]:
-        """Execute the actual download."""
-        session = await self._get_session()
+    async def _download_mpd(self, mpd_url: str, progress_callback=None) -> Optional[str]:
+        """
+        Download MPEG-DASH stream using ffmpeg.
+        ffmpeg handles MPD natively — parses manifest, picks best quality,
+        downloads all segments, and muxes into a proper audio file.
+        """
+        timestamp = int(time.time())
+        output_file = os.path.join(DOWNLOADS_DIR, f"pocketfm_{timestamp}.m4a")
 
-        # Check if it's an M3U8 (HLS) URL
-        if ".m3u8" in url.lower():
-            return await self._download_hls(url, progress_callback)
+        logger.info(f"[MPD] Downloading DASH stream via ffmpeg...")
+        logger.info(f"[MPD] URL: {mpd_url}")
+        logger.info(f"[MPD] Output: {output_file}")
+
+        if progress_callback:
+            try:
+                await progress_callback("Starting MPD/DASH download via ffmpeg...", 0)
+            except Exception:
+                pass
+
+        # ffmpeg command to download DASH audio stream
+        # -i: input MPD URL
+        # -map 0:a: select only audio stream (ignore video if present)
+        # -c:a copy: copy audio codec without re-encoding (fastest, best quality)
+        # -movflags +faststart: optimize for streaming
+        cmd = [
+            "ffmpeg",
+            "-y",                        # Overwrite output
+            "-loglevel", "info",         # Show progress info
+            "-user_agent", USER_AGENT,   # Realistic browser UA
+            "-headers", f"Referer: https://pocketfm.com/\r\n",
+            "-i", mpd_url,               # Input MPD URL
+            "-map", "0:a:0",             # Select first audio stream only
+            "-c:a", "copy",              # Copy codec (no re-encoding)
+            "-movflags", "+faststart",   # Optimize for playback
+            output_file,
+        ]
+
+        try:
+            result = await self._run_ffmpeg(cmd, progress_callback)
+            if result:
+                return output_file
+        except Exception as e:
+            logger.error(f"[MPD] ffmpeg copy failed: {e}")
+
+        # Fallback: try re-encoding to AAC if copy fails
+        logger.info("[MPD] Retrying with AAC re-encoding...")
+        output_file_aac = os.path.join(DOWNLOADS_DIR, f"pocketfm_{timestamp}_aac.m4a")
+
+        cmd_reencode = [
+            "ffmpeg",
+            "-y",
+            "-loglevel", "info",
+            "-user_agent", USER_AGENT,
+            "-headers", f"Referer: https://pocketfm.com/\r\n",
+            "-i", mpd_url,
+            "-map", "0:a:0",
+            "-c:a", "aac",              # Re-encode to AAC
+            "-b:a", "192k",             # High quality bitrate
+            "-movflags", "+faststart",
+            output_file_aac,
+        ]
+
+        try:
+            result = await self._run_ffmpeg(cmd_reencode, progress_callback)
+            if result:
+                return output_file_aac
+        except Exception as e:
+            logger.error(f"[MPD] ffmpeg re-encode also failed: {e}")
+
+        # Fallback 2: try without -map (let ffmpeg auto-select)
+        logger.info("[MPD] Retrying without stream mapping...")
+        output_file_auto = os.path.join(DOWNLOADS_DIR, f"pocketfm_{timestamp}_auto.m4a")
+
+        cmd_auto = [
+            "ffmpeg",
+            "-y",
+            "-loglevel", "info",
+            "-user_agent", USER_AGENT,
+            "-headers", f"Referer: https://pocketfm.com/\r\n",
+            "-i", mpd_url,
+            "-vn",                       # No video
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-movflags", "+faststart",
+            output_file_auto,
+        ]
+
+        try:
+            result = await self._run_ffmpeg(cmd_auto, progress_callback)
+            if result:
+                return output_file_auto
+        except Exception as e:
+            logger.error(f"[MPD] All ffmpeg attempts failed: {e}")
+
+        return None
+
+    async def _download_hls(self, m3u8_url: str, progress_callback=None) -> Optional[str]:
+        """Download HLS stream using ffmpeg."""
+        timestamp = int(time.time())
+        output_file = os.path.join(DOWNLOADS_DIR, f"pocketfm_{timestamp}_hls.m4a")
+
+        logger.info(f"[HLS] Downloading via ffmpeg: {m3u8_url[:150]}")
+
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-loglevel", "info",
+            "-user_agent", USER_AGENT,
+            "-i", m3u8_url,
+            "-vn",
+            "-c:a", "copy",
+            "-movflags", "+faststart",
+            output_file,
+        ]
+
+        try:
+            result = await self._run_ffmpeg(cmd, progress_callback)
+            if result:
+                return output_file
+        except Exception as e:
+            logger.error(f"[HLS] ffmpeg failed: {e}")
+
+        # Fallback: re-encode
+        output_file_aac = os.path.join(DOWNLOADS_DIR, f"pocketfm_{timestamp}_hls_aac.m4a")
+        cmd_aac = [
+            "ffmpeg",
+            "-y",
+            "-loglevel", "info",
+            "-user_agent", USER_AGENT,
+            "-i", m3u8_url,
+            "-vn",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            output_file_aac,
+        ]
+
+        try:
+            result = await self._run_ffmpeg(cmd_aac, progress_callback)
+            if result:
+                return output_file_aac
+        except Exception as e:
+            logger.error(f"[HLS] ffmpeg re-encode failed: {e}")
+
+        return None
+
+    async def _download_direct(self, url: str, progress_callback=None) -> Optional[str]:
+        """Download a direct audio file URL."""
+        session = await self._get_session()
 
         async with session.get(url) as response:
             if response.status != 200:
@@ -137,10 +256,24 @@ class AudioDownloader:
 
             content_type = response.headers.get("Content-Type", "")
             total = int(response.headers.get("Content-Length", 0))
-            filename = self._generate_filename(url, content_type)
-            filepath = os.path.join(DOWNLOADS_DIR, filename)
 
-            logger.info(f"Downloading: {filename} | Size: {total / 1024 / 1024:.2f}MB")
+            # Generate filename
+            parsed = urlparse(url)
+            basename = os.path.basename(unquote(parsed.path))
+            basename = re.sub(r'[<>:"/\\|?*]', '_', basename)
+
+            if not basename or len(basename) < 3:
+                timestamp = int(time.time())
+                basename = f"pocketfm_{timestamp}.mp3"
+
+            # Ensure audio extension
+            _, ext = os.path.splitext(basename)
+            if ext.lower() not in [".mp3", ".m4a", ".aac", ".ogg", ".wav", ".flac"]:
+                basename += ".mp3"
+
+            filepath = os.path.join(DOWNLOADS_DIR, basename)
+
+            logger.info(f"[DIRECT] Downloading: {basename} | Size: {total / 1024 / 1024:.2f}MB")
 
             downloaded = 0
             with open(filepath, "wb") as f:
@@ -150,111 +283,156 @@ class AudioDownloader:
 
                     if progress_callback and total > 0:
                         try:
-                            await progress_callback(downloaded, total)
+                            pct = (downloaded / total) * 100
+                            await progress_callback(
+                                f"Direct download: {pct:.1f}%", pct
+                            )
                         except Exception:
                             pass
 
-            file_size = os.path.getsize(filepath)
-            logger.info(f"Download complete: {filename} ({file_size / 1024 / 1024:.2f}MB)")
-
-            if file_size < 1000:
-                logger.warning(f"File too small ({file_size}B), likely not audio")
-                os.remove(filepath)
-                return None
-
             return filepath
 
-    async def _download_hls(self, m3u8_url: str, progress_callback=None) -> Optional[str]:
-        """Download HLS stream by fetching the M3U8 and concatenating segments."""
-        session = await self._get_session()
+    async def _run_ffmpeg(self, cmd: list, progress_callback=None) -> bool:
+        """
+        Run ffmpeg subprocess asynchronously with real-time progress parsing.
+        Returns True if successful.
+        """
+        logger.info(f"[FFMPEG] Running: {' '.join(cmd[:6])}...")
 
-        logger.info(f"Fetching HLS manifest: {m3u8_url[:100]}")
-        async with session.get(m3u8_url) as resp:
-            if resp.status != 200:
-                logger.error(f"Failed to fetch M3U8: HTTP {resp.status}")
-                return None
-            manifest = await resp.text()
+        try:
+            self._current_process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
 
-        # Check if it's a master playlist (contains other m3u8 references)
-        if "#EXT-X-STREAM-INF" in manifest:
-            # Parse and pick highest quality variant
-            lines = manifest.strip().split("\n")
-            best_bandwidth = 0
-            best_url = None
+            # Read stderr (ffmpeg outputs progress to stderr)
+            duration = None
+            stderr_lines = []
 
-            for i, line in enumerate(lines):
-                if line.startswith("#EXT-X-STREAM-INF"):
-                    bw_match = re.search(r'BANDWIDTH=(\d+)', line)
-                    if bw_match:
-                        bw = int(bw_match.group(1))
-                        if bw > best_bandwidth and i + 1 < len(lines):
-                            best_bandwidth = bw
-                            variant_url = lines[i + 1].strip()
-                            if not variant_url.startswith("http"):
-                                # Relative URL
-                                base = m3u8_url.rsplit("/", 1)[0]
-                                variant_url = f"{base}/{variant_url}"
-                            best_url = variant_url
+            while True:
+                line = await asyncio.wait_for(
+                    self._current_process.stderr.readline(),
+                    timeout=FFMPEG_TIMEOUT,
+                )
 
-            if best_url:
-                logger.info(f"Selected highest quality variant: BW={best_bandwidth}")
-                return await self._download_hls(best_url, progress_callback)
+                if not line:
+                    break
+
+                line_str = line.decode("utf-8", errors="replace").strip()
+                stderr_lines.append(line_str)
+
+                if line_str:
+                    logger.debug(f"[FFMPEG] {line_str}")
+
+                # Parse duration from input info
+                dur_match = re.search(r'Duration:\s*(\d+):(\d+):(\d+)', line_str)
+                if dur_match:
+                    h, m, s = int(dur_match.group(1)), int(dur_match.group(2)), int(dur_match.group(3))
+                    duration = h * 3600 + m * 60 + s
+                    logger.info(f"[FFMPEG] Total duration: {duration}s")
+
+                # Parse progress time
+                time_match = re.search(r'time=(\d+):(\d+):(\d+)', line_str)
+                if time_match and duration and duration > 0:
+                    h, m, s = int(time_match.group(1)), int(time_match.group(2)), int(time_match.group(3))
+                    current = h * 3600 + m * 60 + s
+                    pct = min((current / duration) * 100, 100)
+
+                    if progress_callback:
+                        try:
+                            await progress_callback(
+                                f"FFmpeg encoding: {pct:.1f}% ({current}s/{duration}s)", pct
+                            )
+                        except Exception:
+                            pass
+
+                # Parse size info for download progress
+                size_match = re.search(r'size=\s*(\d+)kB', line_str)
+                if size_match and progress_callback:
+                    size_kb = int(size_match.group(1))
+                    try:
+                        await progress_callback(
+                            f"Downloading: {size_kb / 1024:.1f}MB", 0
+                        )
+                    except Exception:
+                        pass
+
+            await self._current_process.wait()
+            return_code = self._current_process.returncode
+
+            if return_code == 0:
+                logger.info("[FFMPEG] Process completed successfully")
+                return True
             else:
-                logger.error("No variant found in master playlist")
+                # Log last 10 lines of stderr for debugging
+                last_lines = "\n".join(stderr_lines[-10:])
+                logger.error(f"[FFMPEG] Failed with code {return_code}\n{last_lines}")
+                return False
+
+        except asyncio.TimeoutError:
+            logger.error(f"[FFMPEG] Timed out after {FFMPEG_TIMEOUT}s")
+            if self._current_process:
+                self._current_process.kill()
+            return False
+        except Exception as e:
+            logger.error(f"[FFMPEG] Error: {e}")
+            if self._current_process:
+                try:
+                    self._current_process.kill()
+                except Exception:
+                    pass
+            return False
+        finally:
+            self._current_process = None
+
+    async def probe_url(self, url: str) -> Optional[dict]:
+        """
+        Use ffprobe to get stream info from a URL.
+        Returns dict with format and stream details.
+        """
+        cmd = [
+            "ffprobe",
+            "-v", "quiet",
+            "-print_format", "json",
+            "-show_format",
+            "-show_streams",
+            "-user_agent", USER_AGENT,
+            url,
+        ]
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=30)
+
+            if process.returncode == 0:
+                import json
+                info = json.loads(stdout.decode("utf-8"))
+                logger.info(f"[FFPROBE] Stream info: {json.dumps(info, indent=2)[:500]}")
+                return info
+            else:
+                logger.warning(f"[FFPROBE] Failed: {stderr.decode('utf-8', errors='replace')[:200]}")
                 return None
 
-        # It's a media playlist — download segments
-        lines = manifest.strip().split("\n")
-        segment_urls = []
-        for line in lines:
-            line = line.strip()
-            if line and not line.startswith("#"):
-                if not line.startswith("http"):
-                    base = m3u8_url.rsplit("/", 1)[0]
-                    line = f"{base}/{line}"
-                segment_urls.append(line)
-
-        if not segment_urls:
-            logger.error("No segments found in HLS playlist")
+        except Exception as e:
+            logger.error(f"[FFPROBE] Error: {e}")
             return None
 
-        logger.info(f"Found {len(segment_urls)} HLS segments")
-
-        timestamp = int(time.time())
-        filepath = os.path.join(DOWNLOADS_DIR, f"pocketfm_audio_{timestamp}.aac")
-
-        downloaded = 0
-        total_segments = len(segment_urls)
-
-        with open(filepath, "wb") as f:
-            for idx, seg_url in enumerate(segment_urls, 1):
-                try:
-                    async with session.get(seg_url) as seg_resp:
-                        if seg_resp.status == 200:
-                            data = await seg_resp.read()
-                            f.write(data)
-                            downloaded += len(data)
-
-                            if progress_callback:
-                                try:
-                                    await progress_callback(idx, total_segments)
-                                except Exception:
-                                    pass
-                        else:
-                            logger.warning(f"Segment {idx} failed: HTTP {seg_resp.status}")
-                except Exception as e:
-                    logger.warning(f"Segment {idx} error: {e}")
-
-        file_size = os.path.getsize(filepath)
-        logger.info(f"HLS download complete: {filepath} ({file_size / 1024 / 1024:.2f}MB)")
-
-        if file_size < 1000:
-            os.remove(filepath)
-            return None
-
-        return filepath
+    async def cancel(self):
+        """Cancel current download/ffmpeg process."""
+        if self._current_process:
+            try:
+                self._current_process.kill()
+                logger.info("Current download process killed")
+            except Exception as e:
+                logger.debug(f"Process kill error: {e}")
 
     async def close(self):
-        """Close the HTTP session."""
+        """Close the HTTP session and kill any running process."""
+        await self.cancel()
         if self._session and not self._session.closed:
             await self._session.close()

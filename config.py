@@ -57,10 +57,10 @@ MAX_RETRIES = 3
 RETRY_DELAY = 5  # seconds
 FFMPEG_TIMEOUT = 600  # 10 minutes max for ffmpeg process
 
-# ─── Browser User Agent ─────────────────────────────────────────────
+# ─── Browser User Agent (Mobile Spoofing to Bypass DRM) ───────
 USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36"
 )
 
 # ─── Logging ─────────────────────────────────────────────────────────

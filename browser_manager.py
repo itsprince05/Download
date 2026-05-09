@@ -53,7 +53,8 @@ class BrowserManager:
         self._playwright = await async_playwright().start()
 
         self._browser = await self._playwright.chromium.launch(
-            headless=True,
+            channel="chrome",  # Require Google Chrome for Widevine DRM
+            headless=False,    # Run headful (inside Xvfb) to ensure DRM loads
             args=[
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
@@ -67,7 +68,7 @@ class BrowserManager:
                 "--disable-extensions",
                 "--disable-sync",
                 "--disable-translate",
-                "--mute-audio",
+                "--autoplay-policy=no-user-gesture-required", # Crucial for auto-play
                 "--disable-web-security",
             ],
         )
@@ -219,7 +220,7 @@ class BrowserManager:
             logger.error(f"Episode play error: {e}")
             return False
 
-    async def wait_for_audio_detection(self, timeout: int = 60) -> Optional[str]:
+    async def wait_for_audio_detection(self, timeout: int = 60) -> Optional[dict]:
         """Wait up to `timeout` seconds for an audio/MPD URL to be captured."""
         logger.info(f"Waiting up to {timeout}s for audio/MPD URL detection...")
 
@@ -227,19 +228,40 @@ class BrowserManager:
             # Check for MPD URLs first (highest priority for PocketFM)
             mpd_urls = self.network_monitor.get_mpd_urls()
             if mpd_urls:
-                logger.info(f"MPD URL detected after {i+1}s: {mpd_urls[0][:200]}")
+                logger.info(f"MPD URL detected after {i+1}s: {mpd_urls[0]['url'][:200]}")
                 return mpd_urls[0]
 
             # Then check general best URL
-            url = self.network_monitor.get_best_url()
-            if url:
-                logger.info(f"Audio URL detected after {i+1}s: {url[:200]}")
-                return url
+            url_entry = self.network_monitor.get_best_url()
+            if url_entry:
+                logger.info(f"Audio URL detected after {i+1}s: {url_entry['url'][:200]}")
+                return url_entry
 
             await asyncio.sleep(1)
 
         logger.warning(f"No audio/MPD URL detected after {timeout}s")
         return None
+
+    async def get_playback_progress(self) -> Optional[dict]:
+        """Get the playback progress of the active media element."""
+        if not self.is_running:
+            return None
+        try:
+            return await self._page.evaluate("""
+                () => {
+                    const media = document.querySelector('audio, video');
+                    if (!media) return null;
+                    return {
+                        currentTime: media.currentTime,
+                        duration: media.duration,
+                        ended: media.ended,
+                        paused: media.paused
+                    };
+                }
+            """)
+        except Exception as e:
+            logger.debug(f"Playback progress error: {e}")
+            return None
 
     async def get_page_info(self) -> dict:
         """Get current page title and URL."""

@@ -44,11 +44,20 @@ echo "[2/7] Installing Python, ffmpeg, and browser dependencies..."
 apt install -y \
     python3 python3-pip python3-venv \
     wget curl unzip git \
-    ffmpeg \
+    ffmpeg xvfb pulseaudio \
     libnss3 libatk-bridge2.0-0 libdrm2 libxkbcommon0 libgbm1 \
     libpango-1.0-0 libcairo2 libasound2 libxshmfence1 libx11-xcb1 \
     libxcomposite1 libxdamage1 libxrandr2 libatk1.0-0 libcups2 \
     libxss1 libgtk-3-0 fonts-liberation xdg-utils
+
+# Install Google Chrome Stable for Widevine DRM support
+if ! command -v google-chrome &> /dev/null; then
+    echo "  Installing Google Chrome (required for DRM)..."
+    wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add -
+    sh -c 'echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google-chrome.list'
+    apt update
+    apt install -y google-chrome-stable
+fi
 
 # ── Project directory ───────────────────────────────────────────
 PROJECT_DIR="/opt/pocketfm-bot"

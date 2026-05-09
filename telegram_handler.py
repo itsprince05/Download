@@ -178,13 +178,18 @@ async def _run_capture(message: Message):
         # Extract URL and Headers
         audio_url = audio_entry["url"]
         headers_dict = audio_entry.get("headers", {})
+        content_type = audio_entry.get("content_type", "").lower()
         
-        # Identify stream type
-        stream_type = "MPD/DASH" if ".mpd" in audio_url.lower() else "HLS" if ".m3u8" in audio_url.lower() else "Direct"
+        # Identify stream type correctly (using both URL and content-type)
+        is_mpd = ".mpd" in audio_url.lower() or "dash+xml" in content_type
+        is_hls = ".m3u8" in audio_url.lower() or "mpegurl" in content_type
+
+        stream_type_display = "MPD/DASH" if is_mpd else "HLS" if is_hls else "Direct"
+        stream_type_key = "mpd" if is_mpd else "hls" if is_hls else "direct"
 
         await _update_status(
             bot, status_msg,
-            f"🎵 <b>{stream_type} stream found!</b>\n"
+            f"🎵 <b>{stream_type_display} stream found!</b>\n"
             f"<code>{audio_url[:120]}</code>\n\n"
             f"🔍 Probing stream info..."
         )
@@ -233,19 +238,19 @@ async def _run_capture(message: Message):
             except Exception:
                 pass
 
-        if stream_type == "MPD/DASH":
+        if stream_type_key == "mpd":
             await _update_status(
                 bot, status_msg,
-                f"⬇️ <b>Downloading {stream_type} stream...</b>\n"
+                f"⬇️ <b>Downloading {stream_type_display} stream...</b>\n"
                 f"Using extracted network headers to bypass restrictions."
             )
-            filepath = await _audio_downloader.download(audio_url, progress_callback=progress_cb, headers=headers_dict)
+            filepath = await _audio_downloader.download(audio_url, progress_callback=progress_cb, headers=headers_dict, force_stream_type=stream_type_key)
         else:
             await _update_status(
                 bot, status_msg,
-                f"⬇️ <b>Downloading {stream_type} stream...</b>\n"
+                f"⬇️ <b>Downloading {stream_type_display} stream...</b>\n"
             )
-            filepath = await _audio_downloader.download(audio_url, progress_callback=progress_cb, headers=headers_dict)
+            filepath = await _audio_downloader.download(audio_url, progress_callback=progress_cb, headers=headers_dict, force_stream_type=stream_type_key)
 
         if not filepath:
             await _update_status(bot, status_msg, "❌ FFmpeg download failed after all retries.")

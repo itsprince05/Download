@@ -60,9 +60,95 @@ class AudioDownloader:
         else:
             return "direct"
 
-    async def download(self, url: str, progress_callback=None) -> Optional[str]:
+    async def record_system_audio(self, browser_mgr, progress_callback=None) -> Optional[str]:
+        """
+        Record audio directly from PulseAudio (Virtual Sink) while browser plays.
+        100% bypasses Widevine DRM because it captures post-decryption audio.
+        """
+        timestamp = int(time.time())
+        output_file = os.path.join(DOWNLOADS_DIR, f"pocketfm_drm_{timestamp}.mp3")
+
+        logger.info(f"[DRM BYPASS] Starting real-time PulseAudio recording...")
+        logger.info(f"[DRM BYPASS] Output: {output_file}")
+
+        if progress_callback:
+            try:
+                await progress_callback("Starting real-time DRM recording...", 0)
+            except Exception:
+                pass
+
+        # ffmpeg command to capture pulse audio
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-f", "pulse",
+            "-i", "VirtualSink.monitor", # Name of the sink we created in bot.py
+            "-c:a", "libmp3lame",
+            "-b:a", "192k",
+            output_file,
+        ]
+
+        try:
+            self._current_process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+
+            # Monitor playback in browser
+            while True:
+                await asyncio.sleep(2)
+                progress = await browser_mgr.get_playback_progress()
+                if not progress:
+                    continue
+
+                cur = progress.get("currentTime", 0)
+                dur = progress.get("duration", 0)
+                ended = progress.get("ended", False)
+
+                if progress_callback and dur > 0:
+                    pct = min((cur / dur) * 100, 100)
+                    try:
+                        await progress_callback(
+                            f"DRM Real-Time Record\n{int(cur)}s / {int(dur)}s ({pct:.1f}%)", pct
+                        )
+                    except Exception:
+                        pass
+
+                if ended or (dur > 0 and cur >= dur - 1):
+                    logger.info("[DRM BYPASS] Playback ended. Stopping recording.")
+                    break
+
+            # Stop ffmpeg cleanly (send SIGTERM)
+            if self._current_process:
+                self._current_process.terminate()
+                await asyncio.wait_for(self._current_process.wait(), timeout=10)
+
+        except Exception as e:
+            logger.error(f"[DRM BYPASS] Recording error: {e}")
+            if self._current_process:
+                try:
+                    self._current_process.kill()
+                except Exception:
+                    pass
+        finally:
+            self._current_process = None
+
+        if os.path.exists(output_file):
+            size = os.path.getsize(output_file)
+            if size > 50000:  # Valid if >50KB
+                logger.info(f"[DRM BYPASS] Success: {output_file} ({size/1024/1024:.2f}MB)")
+                return output_file
+            else:
+                logger.error(f"[DRM BYPASS] File too small ({size}B), recording failed.")
+                os.remove(output_file)
+
+        return None
+
+    async def download(self, url: str, progress_callback=None, headers: dict = None) -> Optional[str]:
         """
         Download audio from URL. Auto-detects MPD/HLS/direct.
+        Uses network headers (e.g. Authorization, Cookies) to bypass protection.
         Returns the local file path on success.
         """
         stream_type = self._detect_stream_type(url)
@@ -73,11 +159,11 @@ class AudioDownloader:
                 logger.info(f"Download attempt {attempt}/{MAX_RETRIES}")
 
                 if stream_type == "mpd":
-                    result = await self._download_mpd(url, progress_callback)
+                    result = await self._download_mpd(url, progress_callback, headers)
                 elif stream_type == "hls":
-                    result = await self._download_hls(url, progress_callback)
+                    result = await self._download_hls(url, progress_callback, headers)
                 else:
-                    result = await self._download_direct(url, progress_callback)
+                    result = await self._download_direct(url, progress_callback, headers)
 
                 if result and os.path.exists(result):
                     file_size = os.path.getsize(result)
@@ -100,11 +186,12 @@ class AudioDownloader:
         logger.error(f"All {MAX_RETRIES} download attempts failed")
         return None
 
-    async def _download_mpd(self, mpd_url: str, progress_callback=None) -> Optional[str]:
+    async def _download_mpd(self, mpd_url: str, progress_callback=None, headers_dict: dict = None) -> Optional[str]:
         """
         Download MPEG-DASH stream using ffmpeg.
         ffmpeg handles MPD natively — parses manifest, picks best quality,
         downloads all segments, and muxes into a proper audio file.
+        Passes captured headers to authorize the download.
         """
         timestamp = int(time.time())
         output_file = os.path.join(DOWNLOADS_DIR, f"pocketfm_{timestamp}.m4a")
@@ -119,6 +206,16 @@ class AudioDownloader:
             except Exception:
                 pass
 
+        header_args = []
+        if headers_dict:
+            # Add crucial headers
+            header_lines = ""
+            for k, v in headers_dict.items():
+                if k.lower() in ["authorization", "cookie", "referer", "x-user-agent", "x-app-version"]:
+                    header_lines += f"{k}: {v}\r\n"
+            if header_lines:
+                header_args = ["-headers", header_lines]
+
         # ffmpeg command to download DASH audio stream
         # -i: input MPD URL
         # -map 0:a: select only audio stream (ignore video if present)
@@ -129,7 +226,7 @@ class AudioDownloader:
             "-y",                        # Overwrite output
             "-loglevel", "info",         # Show progress info
             "-user_agent", USER_AGENT,   # Realistic browser UA
-            "-headers", f"Referer: https://pocketfm.com/\r\n",
+        ] + header_args + [
             "-i", mpd_url,               # Input MPD URL
             "-map", "0:a:0",             # Select first audio stream only
             "-c:a", "copy",              # Copy codec (no re-encoding)
@@ -153,7 +250,7 @@ class AudioDownloader:
             "-y",
             "-loglevel", "info",
             "-user_agent", USER_AGENT,
-            "-headers", f"Referer: https://pocketfm.com/\r\n",
+        ] + header_args + [
             "-i", mpd_url,
             "-map", "0:a:0",
             "-c:a", "aac",              # Re-encode to AAC
@@ -178,7 +275,7 @@ class AudioDownloader:
             "-y",
             "-loglevel", "info",
             "-user_agent", USER_AGENT,
-            "-headers", f"Referer: https://pocketfm.com/\r\n",
+        ] + header_args + [
             "-i", mpd_url,
             "-vn",                       # No video
             "-c:a", "aac",
@@ -196,18 +293,25 @@ class AudioDownloader:
 
         return None
 
-    async def _download_hls(self, m3u8_url: str, progress_callback=None) -> Optional[str]:
+    async def _download_hls(self, m3u8_url: str, progress_callback=None, headers_dict: dict = None) -> Optional[str]:
         """Download HLS stream using ffmpeg."""
         timestamp = int(time.time())
         output_file = os.path.join(DOWNLOADS_DIR, f"pocketfm_{timestamp}_hls.m4a")
 
         logger.info(f"[HLS] Downloading via ffmpeg: {m3u8_url[:150]}")
+        
+        header_args = []
+        if headers_dict:
+            header_lines = "".join([f"{k}: {v}\r\n" for k, v in headers_dict.items() if k.lower() in ["authorization", "cookie", "referer"]])
+            if header_lines:
+                header_args = ["-headers", header_lines]
 
         cmd = [
             "ffmpeg",
             "-y",
             "-loglevel", "info",
             "-user_agent", USER_AGENT,
+        ] + header_args + [
             "-i", m3u8_url,
             "-vn",
             "-c:a", "copy",
@@ -229,6 +333,7 @@ class AudioDownloader:
             "-y",
             "-loglevel", "info",
             "-user_agent", USER_AGENT,
+        ] + header_args + [
             "-i", m3u8_url,
             "-vn",
             "-c:a", "aac",
@@ -245,11 +350,17 @@ class AudioDownloader:
 
         return None
 
-    async def _download_direct(self, url: str, progress_callback=None) -> Optional[str]:
+    async def _download_direct(self, url: str, progress_callback=None, headers_dict: dict = None) -> Optional[str]:
         """Download a direct audio file URL."""
         session = await self._get_session()
+        
+        req_headers = {}
+        if headers_dict:
+            for k, v in headers_dict.items():
+                if k.lower() in ["authorization", "cookie", "referer"]:
+                    req_headers[k] = v
 
-        async with session.get(url) as response:
+        async with session.get(url, headers=req_headers) as response:
             if response.status != 200:
                 logger.error(f"HTTP {response.status} for {url[:100]}")
                 return None

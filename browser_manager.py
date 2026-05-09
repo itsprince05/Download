@@ -1,5 +1,6 @@
 """
 Browser manager — Playwright-based Chromium controller for PocketFM automation.
+Handles page navigation, episode detection, and network monitoring.
 """
 
 import asyncio
@@ -111,8 +112,8 @@ class BrowserManager:
             )
             logger.info("Page loaded successfully")
 
-            # Wait a bit for dynamic content
-            await asyncio.sleep(3)
+            # Wait for dynamic content to load
+            await asyncio.sleep(5)
             return True
 
         except Exception as e:
@@ -129,21 +130,17 @@ class BrowserManager:
 
             # Strategy 1: Look for episode list items
             episode_selectors = [
-                # Common PocketFM selectors
                 '[class*="episode"] >> nth=0',
                 '[class*="Episode"] >> nth=0',
                 '[data-testid*="episode"] >> nth=0',
                 '[class*="track"] >> nth=0',
                 '[class*="Track"] >> nth=0',
-                # Play buttons
                 'button[aria-label*="play" i] >> nth=0',
                 'button[aria-label*="Play" i] >> nth=0',
                 '[class*="play" i] >> nth=0',
                 '[class*="Play" i] >> nth=0',
-                # Generic play icon areas
                 'svg[class*="play" i] >> nth=0',
                 '[role="button"][class*="play" i] >> nth=0',
-                # Broader — first clickable in episode area
                 '[class*="episode-list"] a >> nth=0',
                 '[class*="episodeList"] a >> nth=0',
                 '[class*="episode_list"] a >> nth=0',
@@ -156,7 +153,7 @@ class BrowserManager:
                         logger.info(f"Found element: {selector}")
                         await el.click(timeout=5000)
                         logger.info("Clicked episode/play element!")
-                        await asyncio.sleep(3)
+                        await asyncio.sleep(5)
                         return True
                 except Exception:
                     continue
@@ -165,7 +162,6 @@ class BrowserManager:
             logger.info("Trying JS-based play detection...")
             played = await self._page.evaluate("""
                 () => {
-                    // Try clicking any audio/play related element
                     const selectors = [
                         '[class*="play"]',
                         '[class*="Play"]',
@@ -181,7 +177,6 @@ class BrowserManager:
                             return sel;
                         }
                     }
-                    // Try first significant link/button
                     const links = document.querySelectorAll('a[href*="episode"], a[href*="listen"]');
                     if (links.length > 0) {
                         links[0].click();
@@ -193,7 +188,7 @@ class BrowserManager:
 
             if played:
                 logger.info(f"JS play triggered via: {played}")
-                await asyncio.sleep(3)
+                await asyncio.sleep(5)
                 return True
 
             # Strategy 3: Look for audio/video elements already present
@@ -225,17 +220,25 @@ class BrowserManager:
             return False
 
     async def wait_for_audio_detection(self, timeout: int = 60) -> Optional[str]:
-        """Wait up to `timeout` seconds for an audio URL to be captured."""
-        logger.info(f"Waiting up to {timeout}s for audio URL detection...")
+        """Wait up to `timeout` seconds for an audio/MPD URL to be captured."""
+        logger.info(f"Waiting up to {timeout}s for audio/MPD URL detection...")
 
         for i in range(timeout):
+            # Check for MPD URLs first (highest priority for PocketFM)
+            mpd_urls = self.network_monitor.get_mpd_urls()
+            if mpd_urls:
+                logger.info(f"MPD URL detected after {i+1}s: {mpd_urls[0][:200]}")
+                return mpd_urls[0]
+
+            # Then check general best URL
             url = self.network_monitor.get_best_url()
             if url:
-                logger.info(f"Audio URL detected after {i+1}s: {url[:150]}")
+                logger.info(f"Audio URL detected after {i+1}s: {url[:200]}")
                 return url
+
             await asyncio.sleep(1)
 
-        logger.warning(f"No audio URL detected after {timeout}s")
+        logger.warning(f"No audio/MPD URL detected after {timeout}s")
         return None
 
     async def get_page_info(self) -> dict:

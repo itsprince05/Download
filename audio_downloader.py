@@ -145,13 +145,13 @@ class AudioDownloader:
 
         return None
 
-    async def download(self, url: str, progress_callback=None, headers: dict = None) -> Optional[str]:
+    async def download(self, url: str, progress_callback=None, headers: dict = None, force_stream_type: str = None) -> Optional[str]:
         """
-        Download audio from URL. Auto-detects MPD/HLS/direct.
+        Download audio from URL. Auto-detects MPD/HLS/direct unless forced.
         Uses network headers (e.g. Authorization, Cookies) to bypass protection.
         Returns the local file path on success.
         """
-        stream_type = self._detect_stream_type(url)
+        stream_type = force_stream_type if force_stream_type else self._detect_stream_type(url)
         logger.info(f"Stream type detected: {stream_type} | URL: {url[:200]}")
 
         for attempt in range(1, MAX_RETRIES + 1):

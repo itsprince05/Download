@@ -1,5 +1,6 @@
 """
-Network request monitor — intercepts all browser traffic to capture audio URLs.
+Network request monitor — intercepts all browser traffic to capture audio/DASH URLs.
+PocketFM uses MPEG-DASH (.mpd) streams, not direct mp3/mp4 files.
 """
 
 import asyncio
@@ -13,7 +14,7 @@ logger = setup_logger("network_monitor")
 
 
 class NetworkMonitor:
-    """Monitors Playwright page network traffic for audio/media URLs."""
+    """Monitors Playwright page network traffic for MPD/audio/media URLs."""
 
     def __init__(self):
         self.captured_urls: list[dict] = []
@@ -21,16 +22,22 @@ class NetworkMonitor:
         self._on_audio_found: Optional[Callable[[str], Awaitable[None]]] = None
         self._lock = asyncio.Lock()
         self._monitoring = False
+        # Store ALL requests for debugging
+        self.all_requests: list[dict] = []
 
     def set_callback(self, callback: Callable[[str], Awaitable[None]]):
         """Set async callback triggered when a new audio URL is found."""
         self._on_audio_found = callback
 
     def _is_audio_url(self, url: str, content_type: str = "") -> bool:
-        """Check if URL or content-type indicates audio content."""
+        """Check if URL or content-type indicates audio/DASH content."""
         parsed = urlparse(url)
         path_lower = parsed.path.lower()
         url_lower = url.lower()
+
+        # MPD is the primary target for PocketFM
+        if ".mpd" in url_lower:
+            return True
 
         # Check file extension
         for ext in AUDIO_EXTENSIONS:
@@ -40,9 +47,14 @@ class NetworkMonitor:
         # Check content-type
         for mime in AUDIO_MIME_TYPES:
             if mime in content_type.lower():
+                # Skip generic HTML/JSON responses
+                if "text/html" in content_type.lower():
+                    return False
+                if "application/json" in content_type.lower():
+                    return False
                 return True
 
-        # Check URL patterns (less reliable, used as hints)
+        # Check URL patterns — need at least 2 matches for non-extension URLs
         pattern_matches = sum(1 for p in MEDIA_URL_PATTERNS if p in url_lower)
         if pattern_matches >= 2:
             return True
@@ -54,35 +66,60 @@ class NetworkMonitor:
         score = 0
         url_lower = url.lower()
 
-        # Direct audio file extensions are strongest signal
+        # ── MPD/DASH is highest priority for PocketFM ───────────
+        if ".mpd" in url_lower:
+            score += 200  # TOP PRIORITY
+            if "audio" in url_lower:
+                score += 50
+            if "episode" in url_lower or "content" in url_lower:
+                score += 40
+
+        # ── DASH content types ──────────────────────────────────
+        ct_lower = content_type.lower()
+        if "dash+xml" in ct_lower:
+            score += 180
+        if "application/xml" in ct_lower and ".mpd" in url_lower:
+            score += 170
+
+        # ── Direct audio file extensions ────────────────────────
         for ext in [".mp3", ".m4a", ".aac", ".flac"]:
             if ext in url_lower:
                 score += 100
 
-        # HLS master/segment
+        # ── HLS ─────────────────────────────────────────────────
         if ".m3u8" in url_lower:
             score += 90
         if ".ts" in url_lower:
             score += 50
 
-        # CDN indicators
-        for cdn in ["cloudfront", "akamai", "fastly", "cdn"]:
+        # ── DASH segment patterns ──────────────────────────────
+        if "/dash/" in url_lower or "dash" in url_lower:
+            score += 30
+        if "init" in url_lower and (".mp4" in url_lower or ".m4s" in url_lower):
+            score += 60  # DASH init segment
+        if ".m4s" in url_lower:
+            score += 40  # DASH media segment
+
+        # ── CDN indicators ──────────────────────────────────────
+        for cdn in ["cloudfront", "akamai", "fastly", "cdn", "cf-"]:
             if cdn in url_lower:
                 score += 20
 
-        # Content type boost
-        if "audio/" in content_type.lower():
+        # ── Audio content type ──────────────────────────────────
+        if "audio/" in ct_lower:
             score += 80
 
-        # Larger files more likely to be actual audio
+        # ── Size indicators ─────────────────────────────────────
         if content_length > 1_000_000:
             score += 40
         elif content_length > 100_000:
             score += 20
 
-        # PocketFM specific patterns
-        if "pocketfm" in url_lower and ("media" in url_lower or "audio" in url_lower):
-            score += 60
+        # ── PocketFM specific ───────────────────────────────────
+        if "pocketfm" in url_lower:
+            score += 30
+            if "media" in url_lower or "audio" in url_lower or "episode" in url_lower:
+                score += 40
 
         return score
 
@@ -91,8 +128,16 @@ class NetworkMonitor:
         url = request.url
         resource_type = request.resource_type
 
+        # Log ALL non-trivial requests for debugging
+        if resource_type not in ("image", "font", "stylesheet", "script"):
+            self.all_requests.append({
+                "url": url,
+                "type": resource_type,
+                "method": request.method,
+            })
+
         if resource_type in ("media", "fetch", "xhr", "other"):
-            logger.debug(f"[REQ] {resource_type}: {url[:150]}")
+            logger.debug(f"[REQ] {resource_type}: {url[:200]}")
 
             if self._is_audio_url(url):
                 await self._register_audio_url(url, "", 0)
@@ -112,6 +157,13 @@ class NetworkMonitor:
         except Exception:
             content_type = ""
             content_length = 0
+
+        # Check for MPD specifically (highest priority)
+        if ".mpd" in url.lower() or "dash+xml" in content_type.lower():
+            logger.info(f"[MPD DETECTED] {url}")
+            logger.info(f"  Content-Type: {content_type}, Size: {content_length}")
+            await self._register_audio_url(url, content_type, content_length)
+            return
 
         if self._is_audio_url(url, content_type):
             logger.info(f"[AUDIO DETECTED] {url[:200]}")
@@ -134,7 +186,7 @@ class NetworkMonitor:
                 return
 
             self.captured_urls.append(entry)
-            logger.info(f"[CAPTURED] Score={score} | {url[:150]}")
+            logger.info(f"[CAPTURED] Score={score} | {url[:200]}")
 
             # Update best URL
             current_best_score = 0
@@ -146,7 +198,7 @@ class NetworkMonitor:
 
             if score > current_best_score:
                 self.best_audio_url = url
-                logger.info(f"[BEST AUDIO] Updated → {url[:150]}")
+                logger.info(f"[BEST AUDIO] Updated → {url[:200]}")
 
                 if self._on_audio_found:
                     try:
@@ -165,7 +217,16 @@ class NetworkMonitor:
         """Return all captured audio URLs sorted by score descending."""
         return sorted(self.captured_urls, key=lambda x: x["score"], reverse=True)
 
+    def get_mpd_urls(self) -> list[str]:
+        """Return only MPD URLs found."""
+        return [e["url"] for e in self.captured_urls if ".mpd" in e["url"].lower()]
+
+    def get_debug_requests(self, limit: int = 30) -> list[dict]:
+        """Return recent non-trivial requests for debugging."""
+        return self.all_requests[-limit:]
+
     def reset(self):
         """Clear all captured data."""
         self.captured_urls.clear()
+        self.all_requests.clear()
         self.best_audio_url = None

@@ -16,7 +16,7 @@ Secure Python Telegram bot using Playwright to automate Chromium, capture audio 
 
 ```
 pocketfm-bot/
-├── main.py                 # Entry point
+├── bot.py                  # Entry point
 ├── config.py               # All configuration & credentials
 ├── logger.py               # Logging setup (file + console)
 ├── browser_manager.py      # Playwright Chromium controller
@@ -70,7 +70,7 @@ source venv/bin/activate
 pip install -r requirements.txt
 playwright install chromium
 playwright install-deps chromium
-python main.py
+python bot.py
 ```
 
 ### Service Management

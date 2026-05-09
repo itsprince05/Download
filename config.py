@@ -26,24 +26,36 @@ SCREENSHOT_QUALITY = 60  # JPEG quality (1-100) for Telegram compression
 MAX_SCREENSHOT_SIZE_KB = 9500  # Telegram limit ~10MB, keep under
 
 # ─── Network Monitor Settings ───────────────────────────────────────
-AUDIO_EXTENSIONS = [".mp3", ".m4a", ".aac", ".ogg", ".wav", ".flac", ".opus", ".webm"]
+# PocketFM uses MPEG-DASH (.mpd) for streaming, NOT direct mp3/mp4
+AUDIO_EXTENSIONS = [
+    ".mpd",       # DASH manifest (PRIMARY for PocketFM)
+    ".m3u8",      # HLS manifest
+    ".mp3", ".m4a", ".aac", ".ogg", ".wav", ".flac", ".opus", ".webm",
+]
 AUDIO_MIME_TYPES = [
+    "application/dash+xml",              # MPD content type
+    "application/xml",                    # MPD sometimes served as XML
+    "text/xml",                           # MPD sometimes served as text/xml
     "audio/",
+    "video/",                             # DASH audio can be in video/ container
     "application/octet-stream",
     "application/x-mpegURL",
     "application/vnd.apple.mpegurl",
 ]
 MEDIA_URL_PATTERNS = [
+    ".mpd", "dash", "manifest",           # DASH patterns (PocketFM primary)
     "cdn", "media", "audio", "stream", "play", "hls",
     ".m3u8", ".ts", ".mp3", ".m4a", ".aac",
     "cloudfront", "akamai", "fastly",
+    "pocketfm", "episode", "content",
 ]
 
 # ─── Download Settings ──────────────────────────────────────────────
-DOWNLOAD_TIMEOUT = 300  # 5 minutes max per download
+DOWNLOAD_TIMEOUT = 600  # 10 minutes max per download (DASH can be slow)
 DOWNLOAD_CHUNK_SIZE = 1024 * 64  # 64KB chunks
 MAX_RETRIES = 3
 RETRY_DELAY = 5  # seconds
+FFMPEG_TIMEOUT = 600  # 10 minutes max for ffmpeg process
 
 # ─── Browser User Agent ─────────────────────────────────────────────
 USER_AGENT = (

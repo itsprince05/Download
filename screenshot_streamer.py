@@ -32,7 +32,7 @@ class ScreenshotStreamer:
         self._task: Optional[asyncio.Task] = None
         self._running = False
         self._page = None
-        self._message_id: Optional[int] = None  # For editing the same message
+        self._message_id: Optional[int] = None
 
         os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
 
@@ -59,7 +59,6 @@ class ScreenshotStreamer:
         """Compress screenshot to fit within Telegram's file size limit."""
         img = Image.open(BytesIO(raw_bytes))
 
-        # Start with configured quality
         quality = SCREENSHOT_QUALITY
         while quality >= 10:
             buffer = BytesIO()
@@ -72,7 +71,6 @@ class ScreenshotStreamer:
 
             quality -= 10
 
-        # Last resort — resize
         img = img.resize((1280, 720), Image.Resampling.LANCZOS)
         buffer = BytesIO()
         img.save(buffer, format="JPEG", quality=40, optimize=True)
@@ -88,26 +86,17 @@ class ScreenshotStreamer:
                     logger.warning("Page is closed, stopping screenshots")
                     break
 
-                # Capture screenshot
-                raw = await self._page.screenshot(
-                    full_page=False,
-                    type="png",
-                )
+                raw = await self._page.screenshot(full_page=False, type="png")
                 compressed = self._compress_screenshot(raw)
                 frame_count += 1
                 timestamp = time.strftime("%H:%M:%S")
 
-                photo = BufferedInputFile(
-                    compressed,
-                    filename=f"live_{frame_count}.jpg",
-                )
+                photo = BufferedInputFile(compressed, filename=f"live_{frame_count}.jpg")
                 caption = f"🖥 Live Monitor | Frame #{frame_count} | {timestamp}"
 
                 try:
                     if self._message_id:
-                        # Try editing the existing photo message
                         from aiogram.types import InputMediaPhoto
-
                         media = InputMediaPhoto(media=photo, caption=caption)
                         await self.bot.edit_message_media(
                             chat_id=ALLOWED_GROUP_ID,
@@ -115,7 +104,6 @@ class ScreenshotStreamer:
                             media=media,
                         )
                     else:
-                        # Send first screenshot
                         msg = await self.bot.send_photo(
                             chat_id=ALLOWED_GROUP_ID,
                             photo=photo,
@@ -124,7 +112,6 @@ class ScreenshotStreamer:
                         self._message_id = msg.message_id
                 except Exception as e:
                     error_str = str(e).lower()
-                    # If edit fails (message too old, etc.), send new one
                     if "message" in error_str or "not found" in error_str or "edit" in error_str:
                         try:
                             msg = await self.bot.send_photo(
@@ -138,7 +125,6 @@ class ScreenshotStreamer:
                     else:
                         logger.error(f"Screenshot send error: {e}")
 
-                # Clean up old screenshot files from disk
                 self._cleanup_old_files()
 
             except asyncio.CancelledError:

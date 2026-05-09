@@ -80,16 +80,42 @@ async def main():
         except NotImplementedError:
             pass
 
+    # ── Check if this is a restart after /update ──────────────────
+    flag_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".update_restart")
+    is_update_restart = False
+    update_info = ""
+
+    if os.path.exists(flag_path):
+        is_update_restart = True
+        try:
+            with open(flag_path, "r") as f:
+                lines = f.read().strip().split("\n", 1)
+                update_info = lines[1] if len(lines) > 1 else "No details"
+            os.remove(flag_path)
+            logger.info("Update restart flag detected and removed")
+        except Exception as e:
+            logger.debug(f"Flag read error: {e}")
+
     # ── Send startup notification ───────────────────────────────
     try:
-        await bot.send_message(
-            ALLOWED_GROUP_ID,
-            "🟢 <b>PocketFM Capture Bot is online!</b>\n\n"
-            "📡 Supports: MPD/DASH, HLS, Direct files\n"
-            "Send /capture to start audio extraction.\n"
-            "Send /help for all commands.",
-            parse_mode="HTML",
-        )
+        if is_update_restart:
+            await bot.send_message(
+                ALLOWED_GROUP_ID,
+                "✅ <b>Bot updated and restarted successfully!</b>\n\n"
+                f"📋 Git: <code>{update_info[:300]}</code>\n\n"
+                "🟢 Bot is now running with latest code.\n"
+                "Send /help for all commands.",
+                parse_mode="HTML",
+            )
+        else:
+            await bot.send_message(
+                ALLOWED_GROUP_ID,
+                "🟢 <b>PocketFM Capture Bot is online!</b>\n\n"
+                "📡 Supports: MPD/DASH, HLS, Direct files\n"
+                "Send /capture to start audio extraction.\n"
+                "Send /help for all commands.",
+                parse_mode="HTML",
+            )
     except Exception as e:
         logger.error(f"Failed to send startup message: {e}")
 

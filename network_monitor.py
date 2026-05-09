@@ -140,7 +140,11 @@ class NetworkMonitor:
             logger.debug(f"[REQ] {resource_type}: {url[:200]}")
 
             if self._is_audio_url(url):
-                await self._register_audio_url(url, "", 0)
+                try:
+                    headers = await request.all_headers()
+                except Exception:
+                    headers = {}
+                await self._register_audio_url(url, "", 0, headers)
 
     async def on_response(self, response):
         """Handle incoming response event from Playwright."""
@@ -158,19 +162,24 @@ class NetworkMonitor:
             content_type = ""
             content_length = 0
 
+        try:
+            req_headers = await response.request.all_headers()
+        except Exception:
+            req_headers = {}
+
         # Check for MPD specifically (highest priority)
         if ".mpd" in url.lower() or "dash+xml" in content_type.lower():
             logger.info(f"[MPD DETECTED] {url}")
             logger.info(f"  Content-Type: {content_type}, Size: {content_length}")
-            await self._register_audio_url(url, content_type, content_length)
+            await self._register_audio_url(url, content_type, content_length, req_headers)
             return
 
         if self._is_audio_url(url, content_type):
             logger.info(f"[AUDIO DETECTED] {url[:200]}")
             logger.info(f"  Content-Type: {content_type}, Size: {content_length}")
-            await self._register_audio_url(url, content_type, content_length)
+            await self._register_audio_url(url, content_type, content_length, req_headers)
 
-    async def _register_audio_url(self, url: str, content_type: str, content_length: int):
+    async def _register_audio_url(self, url: str, content_type: str, content_length: int, headers: dict = None):
         """Register a detected audio URL and update best candidate."""
         async with self._lock:
             score = self._score_url(url, content_type, content_length)
@@ -179,6 +188,7 @@ class NetworkMonitor:
                 "content_type": content_type,
                 "content_length": content_length,
                 "score": score,
+                "headers": headers or {},
             }
 
             # Avoid duplicates
@@ -206,20 +216,19 @@ class NetworkMonitor:
                     except Exception as e:
                         logger.error(f"Audio callback error: {e}")
 
-    def get_best_url(self) -> Optional[str]:
-        """Return the highest-scored audio URL captured so far."""
+    def get_best_url(self) -> Optional[dict]:
+        """Return the highest-scored audio URL entry captured so far."""
         if not self.captured_urls:
             return None
-        best = max(self.captured_urls, key=lambda x: x["score"])
-        return best["url"]
+        return max(self.captured_urls, key=lambda x: x["score"])
 
     def get_all_urls(self) -> list[dict]:
         """Return all captured audio URLs sorted by score descending."""
         return sorted(self.captured_urls, key=lambda x: x["score"], reverse=True)
 
-    def get_mpd_urls(self) -> list[str]:
-        """Return only MPD URLs found."""
-        return [e["url"] for e in self.captured_urls if ".mpd" in e["url"].lower()]
+    def get_mpd_urls(self) -> list[dict]:
+        """Return only MPD URL entries found."""
+        return [e for e in self.captured_urls if ".mpd" in e["url"].lower()]
 
     def get_debug_requests(self, limit: int = 30) -> list[dict]:
         """Return recent non-trivial requests for debugging."""

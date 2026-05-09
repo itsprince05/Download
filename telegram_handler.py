@@ -144,9 +144,9 @@ async def _run_capture(message: Message):
             "🔍 Monitoring network traffic for .mpd / audio URLs...\n"
             "⏳ This may take up to 90 seconds..."
         )
-        audio_url = await _browser_mgr.wait_for_audio_detection(timeout=90)
+        audio_entry = await _browser_mgr.wait_for_audio_detection(timeout=90)
 
-        if not audio_url:
+        if not audio_entry:
             # Show debug info
             all_urls = _browser_mgr.network_monitor.get_all_urls()
             debug_reqs = _browser_mgr.network_monitor.get_debug_requests(20)
@@ -175,6 +175,10 @@ async def _run_capture(message: Message):
             await _update_status(bot, status_msg, "❌ Capture failed — no streams found.")
             return
 
+        # Extract URL and Headers
+        audio_url = audio_entry["url"]
+        headers_dict = audio_entry.get("headers", {})
+        
         # Identify stream type
         stream_type = "MPD/DASH" if ".mpd" in audio_url.lower() else "HLS" if ".m3u8" in audio_url.lower() else "Direct"
 
@@ -209,13 +213,7 @@ async def _run_capture(message: Message):
                 )
             await bot.send_message(chat_id, info_text, parse_mode=ParseMode.HTML)
 
-        # ── Step 6: Download via FFmpeg ─────────────────────────
-        await _update_status(
-            bot, status_msg,
-            f"⬇️ <b>Downloading {stream_type} stream via FFmpeg...</b>\n"
-            f"This uses ffmpeg to properly download and mux the audio."
-        )
-
+        # ── Step 6: Download or Record ──────────────────────────────
         last_progress_update = [0]
 
         async def progress_cb(status_text, pct):
@@ -226,16 +224,28 @@ async def _run_capture(message: Message):
 
             if pct > 0:
                 bar = "█" * int(pct / 5) + "░" * (20 - int(pct / 5))
-                text = f"⬇️ <b>FFmpeg Download</b>\n[{bar}] {pct:.1f}%\n{status_text}"
+                text = f"⬇️ <b>Processing Audio</b>\n[{bar}] {pct:.1f}%\n{status_text}"
             else:
-                text = f"⬇️ <b>FFmpeg Download</b>\n{status_text}"
+                text = f"⬇️ <b>Processing Audio</b>\n{status_text}"
 
             try:
                 await _update_status(bot, status_msg, text)
             except Exception:
                 pass
 
-        filepath = await _audio_downloader.download(audio_url, progress_callback=progress_cb)
+        if stream_type == "MPD/DASH":
+            await _update_status(
+                bot, status_msg,
+                f"⬇️ <b>Downloading {stream_type} stream...</b>\n"
+                f"Using extracted network headers to bypass restrictions."
+            )
+            filepath = await _audio_downloader.download(audio_url, progress_callback=progress_cb, headers=headers_dict)
+        else:
+            await _update_status(
+                bot, status_msg,
+                f"⬇️ <b>Downloading {stream_type} stream...</b>\n"
+            )
+            filepath = await _audio_downloader.download(audio_url, progress_callback=progress_cb, headers=headers_dict)
 
         if not filepath:
             await _update_status(bot, status_msg, "❌ FFmpeg download failed after all retries.")

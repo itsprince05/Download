@@ -5,6 +5,7 @@ PocketFM uses MPEG-DASH (.mpd) — this handler manages the full capture pipelin
 
 import asyncio
 import os
+import sys
 import time
 from typing import Optional
 
@@ -14,7 +15,7 @@ from aiogram.filters import Command
 from aiogram.enums import ParseMode, ChatType
 
 from logger import setup_logger
-from config import BOT_TOKEN, ALLOWED_GROUP_ID
+from config import BOT_TOKEN, ALLOWED_GROUP_ID, BASE_DIR
 
 logger = setup_logger("telegram_handler")
 
@@ -60,6 +61,7 @@ async def cmd_start(message: Message):
         "├ /screenshot — Take a single screenshot\n"
         "├ /urls — Show all captured media URLs\n"
         "├ /debug — Show all network requests\n"
+        "├ /update — Pull latest code & restart bot\n"
         "├ /stop — Stop current session\n"
         "└ /help — Show this message\n\n"
         "📡 <b>Supports:</b> MPD/DASH, HLS/M3U8, Direct files\n"
@@ -428,6 +430,111 @@ async def cmd_debug(message: Message):
         text = text[:4000] + "..."
 
     await message.answer(text, parse_mode=ParseMode.HTML)
+
+
+# ─── /update command ────────────────────────────────────────────────
+@router.message(Command("update"), F.chat.id == ALLOWED_GROUP_ID)
+async def cmd_update(message: Message):
+    """Pull latest code from git, install deps, and restart the bot."""
+    bot = message.bot
+    chat_id = ALLOWED_GROUP_ID
+
+    status_msg = await message.answer(
+        "🔄 <b>Updating bot...</b>\n\n⏳ Running git pull...",
+        parse_mode=ParseMode.HTML,
+    )
+
+    try:
+        # ── Step 1: git pull ─────────────────────────────────────
+        git_proc = await asyncio.create_subprocess_exec(
+            "git", "pull", "--force",
+            cwd=BASE_DIR,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        git_stdout, git_stderr = await asyncio.wait_for(git_proc.communicate(), timeout=60)
+        git_output = git_stdout.decode("utf-8", errors="replace").strip()
+        git_err = git_stderr.decode("utf-8", errors="replace").strip()
+        git_code = git_proc.returncode
+
+        if git_code != 0:
+            await bot.edit_message_text(
+                text=(
+                    f"❌ <b>git pull failed</b> (code {git_code})\n\n"
+                    f"<code>{git_err[:500] or git_output[:500]}</code>"
+                ),
+                chat_id=chat_id,
+                message_id=status_msg.message_id,
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        await bot.edit_message_text(
+            text=(
+                f"🔄 <b>Updating bot...</b>\n\n"
+                f"✅ git pull done:\n<code>{git_output[:300]}</code>\n\n"
+                f"⏳ Installing dependencies..."
+            ),
+            chat_id=chat_id,
+            message_id=status_msg.message_id,
+            parse_mode=ParseMode.HTML,
+        )
+
+        # ── Step 2: pip install ──────────────────────────────────
+        pip_proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-m", "pip", "install", "-r", "requirements.txt", "--quiet",
+            cwd=BASE_DIR,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        pip_stdout, pip_stderr = await asyncio.wait_for(pip_proc.communicate(), timeout=120)
+        pip_output = pip_stdout.decode("utf-8", errors="replace").strip()
+        pip_code = pip_proc.returncode
+
+        pip_status = "✅" if pip_code == 0 else "⚠️"
+
+        # ── Step 3: Create restart flag ──────────────────────────
+        flag_path = os.path.join(BASE_DIR, ".update_restart")
+        with open(flag_path, "w") as f:
+            f.write(f"{int(time.time())}\n{git_output[:200]}")
+
+        await bot.edit_message_text(
+            text=(
+                f"🔄 <b>Update complete!</b>\n\n"
+                f"✅ git pull: <code>{git_output[:200]}</code>\n"
+                f"{pip_status} pip install: code {pip_code}\n\n"
+                f"🔁 <b>Restarting bot now...</b>"
+            ),
+            chat_id=chat_id,
+            message_id=status_msg.message_id,
+            parse_mode=ParseMode.HTML,
+        )
+
+        # Small delay so the message is sent before exit
+        await asyncio.sleep(1)
+
+        # ── Step 4: Exit — systemd will auto-restart ────────────
+        logger.info("Bot exiting for update restart...")
+        os._exit(0)
+
+    except asyncio.TimeoutError:
+        await bot.edit_message_text(
+            text="❌ <b>Update timed out.</b> Check VPS manually.",
+            chat_id=chat_id,
+            message_id=status_msg.message_id,
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as e:
+        logger.error(f"Update error: {e}", exc_info=True)
+        try:
+            await bot.edit_message_text(
+                text=f"❌ <b>Update failed:</b>\n<code>{str(e)[:500]}</code>",
+                chat_id=chat_id,
+                message_id=status_msg.message_id,
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
 
 
 # ─── /stop command ──────────────────────────────────────────────────

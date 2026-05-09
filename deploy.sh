@@ -63,7 +63,7 @@ mkdir -p "$PROJECT_DIR"
 
 # Copy all flat .py files and other needed files
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [ -f "$SCRIPT_DIR/main.py" ]; then
+if [ -f "$SCRIPT_DIR/bot.py" ]; then
     echo "  Copying project files..."
     cp -f "$SCRIPT_DIR"/*.py "$PROJECT_DIR/"
     cp -f "$SCRIPT_DIR"/requirements.txt "$PROJECT_DIR/"
@@ -106,7 +106,7 @@ Wants=network-online.target
 Type=simple
 User=root
 WorkingDirectory=$PROJECT_DIR
-ExecStart=$PYTHON_PATH main.py
+ExecStart=$PYTHON_PATH bot.py
 Restart=always
 RestartSec=10
 StartLimitIntervalSec=60
